@@ -307,8 +307,7 @@ class PluginRegistry:
             if manifest.plugin_name != name:
                 raise PluginLoadError(
                     name,
-                    f"manifest name mismatch: "
-                    f"'{manifest.plugin_name}' != '{name}'",
+                    f"manifest name mismatch: '{manifest.plugin_name}' != '{name}'",
                 )
             if manifest.version != plugin.version:
                 raise PluginLoadError(
