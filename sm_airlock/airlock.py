@@ -7,6 +7,12 @@ supplied by the caller, not hard-coded. Identity information (``agent_id``,
 implementation so the Airlock never needs to know how the host agent
 represents itself internally.
 
+The ``Airlock`` filters attribute access on the proxy object it hands to
+plugins. It is not an isolation boundary: plugin code shares the host's
+interpreter, so introspection such as ``object.__getattribute__``, the
+``gc`` module or frame objects can still reach the host agent. See the
+``Airlock`` class docstring for details.
+
 Effect staging is intentionally not part of the Airlock. Callers that need
 speculative side-effect staging should compose with a separate staging
 primitive (for example, the ``Enclave`` type in ``sm-enclave``).
@@ -21,7 +27,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 from .exceptions import AirlockViolation, PluginRateLimitExceeded
 from .spec import AgentIdentity, AllowlistSpec
@@ -132,16 +138,187 @@ class PluginManifest:
     signed_at: str
 
 
+#: Names served by the ``Airlock`` itself rather than through the allowlist.
+_OWN_ATTRIBUTES = frozenset({"agent_id", "did", "tenant_id"})
+
+
+class _AirlockState:
+    """Internal state of one ``Airlock``. Never handed to plugins."""
+
+    __slots__ = (
+        "agent",
+        "allowlist",
+        "call_timestamps",
+        "identity",
+        "plugin_name",
+        "rate_limit_lock",
+        "violation_callback",
+    )
+
+    def __init__(
+        self,
+        agent: Any,
+        identity: AgentIdentity,
+        allowlist: AllowlistSpec,
+        plugin_name: str,
+        violation_callback: Callable[[str, dict[str, Any]], None] | None,
+    ) -> None:
+        self.agent = agent
+        self.identity = identity
+        self.allowlist = allowlist
+        self.plugin_name = plugin_name
+        self.violation_callback = violation_callback
+        self.call_timestamps: dict[str, deque[float]] = {}
+        self.rate_limit_lock = threading.Lock()
+
+    def resolve(self, name: str) -> Any:
+        """Return the allowlisted member ``name`` or refuse the access."""
+        if name in self.allowlist.methods:
+            target = getattr(self.agent, name, None)
+            if target is None:
+                return None
+            return _GatedMethod(self, name, target)
+        if name in self.allowlist.properties:
+            return getattr(self.agent, name, None)
+        self.deny(name)
+
+    def deny(self, attr_name: str, operation: str = "access") -> NoReturn:
+        """Report a violation and raise ``AirlockViolation``."""
+        self.report_violation(attr_name)
+        raise AirlockViolation(
+            agent_did=self.identity.did,
+            attempted_operation=f"{operation} '{attr_name}'",
+            sandbox_boundary="plugin sandbox",
+        )
+
+    def report_violation(self, attr_name: str) -> None:
+        """Report a sandbox violation via callback and logging.
+
+        Does not raise — callers raise after this returns.
+        """
+        metadata: dict[str, Any] = {
+            "attempted_attr": attr_name,
+            "plugin_name": self.plugin_name,
+            "tenant_id": self.identity.tenant_id,
+            "agent_did": self.identity.did,
+        }
+        if self.violation_callback is not None:
+            try:
+                self.violation_callback("sandbox.violation", metadata)
+            except Exception:
+                logger.warning(
+                    "Violation callback failed for attr=%s",
+                    attr_name,
+                    exc_info=True,
+                )
+        logger.warning(
+            "Airlock violation: plugin=%s attempted access to '%s'",
+            self.plugin_name,
+            attr_name,
+        )
+
+    def check_rate_limit(self, method: str) -> None:
+        """Enforce the per-method rate limit configured on the allowlist.
+
+        Raises:
+            PluginRateLimitExceeded: If the method has been called too many
+                times within the current 60-second window.
+        """
+        limit = self.allowlist.rate_limit_for(method)
+        if limit is None:
+            return
+
+        with self.rate_limit_lock:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            timestamps = self.call_timestamps.setdefault(method, deque())
+            # Prune entries older than 60 seconds. deque.popleft is O(1).
+            while timestamps and timestamps[0] <= cutoff:
+                timestamps.popleft()
+
+            if len(timestamps) >= limit:
+                self.report_violation(method)
+                raise PluginRateLimitExceeded(self.plugin_name, method, limit)
+            timestamps.append(now)
+
+
+class _GatedMethod:
+    """Callable returned for an allowlisted method.
+
+    Calling it applies the rate limit and forwards to the host agent's
+    method. Unlike a plain closure or bound method, it does not expose the
+    host agent through ``__self__``, ``__closure__``, ``__func__`` or
+    similar attributes: attribute access other than ``__name__`` and
+    ``__class__`` is refused.
+    """
+
+    __slots__ = ("_name", "_state", "_target")
+
+    def __init__(self, state: _AirlockState, name: str, target: Any) -> None:
+        object.__setattr__(self, "_state", state)
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_target", target)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        state: _AirlockState = object.__getattribute__(self, "_state")
+        state.check_rate_limit(object.__getattribute__(self, "_name"))
+        return object.__getattribute__(self, "_target")(*args, **kwargs)
+
+    def __getattribute__(self, attr: str) -> Any:
+        if attr == "__class__":
+            return object.__getattribute__(self, attr)
+        name: str = object.__getattribute__(self, "_name")
+        if attr == "__name__":
+            return name
+        state: _AirlockState = object.__getattribute__(self, "_state")
+        state.deny(f"{name}.{attr}")
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        state: _AirlockState = object.__getattribute__(self, "_state")
+        state.deny(f"{object.__getattribute__(self, '_name')}.{attr}", "set")
+
+    def __delattr__(self, attr: str) -> None:
+        state: _AirlockState = object.__getattribute__(self, "_state")
+        state.deny(f"{object.__getattribute__(self, '_name')}.{attr}", "delete")
+
+    def __repr__(self) -> str:
+        return f"<airlock method {object.__getattribute__(self, '_name')!r}>"
+
+
+def _state_of(airlock: Airlock) -> _AirlockState:
+    state: _AirlockState = object.__getattribute__(airlock, "_state")
+    return state
+
+
 class Airlock:
     """Restricts plugin access to the host agent's public API surface.
 
-    The ``Airlock`` is the agent-level capability boundary. Attribute
-    access goes through an explicit allowlist; anything outside raises
-    ``AirlockViolation`` and fires the violation callback.
+    Attribute access on the ``Airlock`` goes through an explicit allowlist;
+    anything outside it raises ``AirlockViolation`` and fires the violation
+    callback. Besides the allowlisted members, the ``Airlock`` serves only
+    ``agent_id``, ``did`` and ``tenant_id`` (from the injected identity) and
+    ``__class__``. Its own state, including the reference to the host agent,
+    is not readable through attribute access: ``airlock._agent``,
+    ``airlock.__dict__``, ``vars(airlock)``, ``copy``/``pickle`` hooks, and
+    the ``__self__``/``__closure__`` of returned methods are all refused.
+    Setting or deleting attributes on the ``Airlock`` is refused as well.
+
+    Limits: this is an in-process attribute filter, not an isolation
+    boundary. Plugin code runs in the same interpreter as the host and can
+    still reach the host agent by interpreter-level means, for example
+    ``object.__getattribute__(airlock, "_state")``, descriptors on
+    ``type(airlock)``, the ``gc`` module, or frame objects
+    (``sys._getframe()``, exception tracebacks). Values returned by
+    allowlisted methods and properties are passed through unchanged, so an
+    allowlisted member that returns the agent, or an object that references
+    it, gives the plugin that reference. Code that must not reach the host
+    agent has to run in a separate process.
 
     The allowlist and agent identity are both injected dependencies. The
     ``Airlock`` never inspects the host agent's private state.
     """
+
+    __slots__ = ("__weakref__", "_state")
 
     def __init__(
         self,
@@ -168,97 +345,47 @@ class Airlock:
                 fired when a plugin attempts out-of-allowlist access or
                 exceeds a rate limit.
         """
-        self._agent = agent
-        self._identity = identity
-        self._allowlist = allowlist
-        self._plugin_name = plugin_name
-        self._violation_callback = violation_callback
-
-        self._call_timestamps: dict[str, deque[float]] = {}
-        self._rate_limit_lock = threading.Lock()
+        object.__setattr__(
+            self,
+            "_state",
+            _AirlockState(agent, identity, allowlist, plugin_name, violation_callback),
+        )
 
     @property
     def tenant_id(self) -> str:
-        return self._identity.tenant_id
+        return _state_of(self).identity.tenant_id
 
     @property
     def agent_id(self) -> str:
-        return self._identity.agent_id
+        return _state_of(self).identity.agent_id
 
     @property
     def did(self) -> str:
-        return self._identity.did
+        return _state_of(self).identity.did
 
-    def __getattr__(self, name: str) -> Any:
-        """Allowlist-based attribute access for plugins."""
-        if name in self._allowlist.methods:
-            method = getattr(self._agent, name, None)
-            if method is None:
-                return None
+    def __getattribute__(self, name: str) -> Any:
+        """Allowlist-based attribute access for plugins.
 
-            def _rate_limited_wrapper(*args: Any, **kwargs: Any) -> Any:
-                self._check_rate_limit(name)
-                return method(*args, **kwargs)
-
-            return _rate_limited_wrapper
-        if name in self._allowlist.properties:
-            return getattr(self._agent, name, None)
-        self._report_violation(name)
-        raise AirlockViolation(
-            agent_did=self.did,
-            attempted_operation=f"access '{name}'",
-            sandbox_boundary="plugin sandbox",
-        )
-
-    def _report_violation(self, attr_name: str) -> None:
-        """Report a sandbox violation via callback and logging.
-
-        Does not raise — callers raise after this returns.
+        Runs for every attribute lookup on the instance, so names defined
+        on the ``Airlock`` itself (its state, methods, ``__dict__`` and so
+        on) are refused like any other name outside the allowlist.
         """
-        metadata: dict[str, Any] = {
-            "attempted_attr": attr_name,
-            "plugin_name": self._plugin_name,
-            "tenant_id": self.tenant_id,
-            "agent_did": self.did,
-        }
-        if self._violation_callback is not None:
-            try:
-                self._violation_callback("sandbox.violation", metadata)
-            except Exception:
-                logger.warning(
-                    "Violation callback failed for attr=%s",
-                    attr_name,
-                    exc_info=True,
-                )
-        logger.warning(
-            "Airlock violation: plugin=%s attempted access to '%s'",
-            self._plugin_name,
-            attr_name,
-        )
+        if name in _OWN_ATTRIBUTES or name == "__class__":
+            return object.__getattribute__(self, name)
+        return _state_of(self).resolve(name)
 
-    def _check_rate_limit(self, method: str) -> None:
-        """Enforce the per-method rate limit configured on the allowlist.
+    def __setattr__(self, name: str, value: Any) -> None:
+        _state_of(self).deny(name, "set")
 
-        Raises:
-            PluginRateLimitExceeded: If the method has been called too many
-                times within the current 60-second window.
-        """
-        limit = self._allowlist.rate_limit_for(method)
-        if limit is None:
-            return
+    def __delattr__(self, name: str) -> None:
+        _state_of(self).deny(name, "delete")
 
-        with self._rate_limit_lock:
-            now = time.monotonic()
-            cutoff = now - 60.0
-            timestamps = self._call_timestamps.setdefault(method, deque())
-            # Prune entries older than 60 seconds. deque.popleft is O(1).
-            while timestamps and timestamps[0] <= cutoff:
-                timestamps.popleft()
+    def __dir__(self) -> list[str]:
+        allowlist = _state_of(self).allowlist
+        return sorted(_OWN_ATTRIBUTES | allowlist.methods | allowlist.properties)
 
-            if len(timestamps) >= limit:
-                self._report_violation(method)
-                raise PluginRateLimitExceeded(self._plugin_name, method, limit)
-            timestamps.append(now)
+    def __repr__(self) -> str:
+        return f"<Airlock plugin={_state_of(self).plugin_name!r}>"
 
 
 class PluginRegistry:

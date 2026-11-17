@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+import pickle
 import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -327,3 +330,152 @@ class TestRateLimitThreadSafety:
         assert successes == 500
         assert rejections == 300
         assert successes + rejections == 800
+
+
+# ---------------------------------------------------------------------------
+# The wrapped agent is not reachable through attribute access on the proxy
+# ---------------------------------------------------------------------------
+
+
+class TestWrappedAgentNotReachable:
+    """Ordinary attribute paths from the Airlock to the host agent are refused.
+
+    ``__getattr__`` alone only runs for missing names, so attributes stored on
+    the proxy (such as the agent reference) used to bypass the allowlist.
+    """
+
+    @pytest.fixture
+    def events(self) -> list[str]:
+        return []
+
+    @pytest.fixture
+    def airlock(
+        self,
+        agent: _Agent,
+        identity: _Identity,
+        basic_allowlist: AllowlistSpec,
+        events: list[str],
+    ) -> Airlock:
+        return Airlock(
+            agent,
+            identity,
+            basic_allowlist,
+            plugin_name="p",
+            violation_callback=lambda e, m: events.append(m["attempted_attr"]),
+        )
+
+    @pytest.mark.parametrize(
+        "attr",
+        [
+            # Names the previous implementation stored on the instance.
+            "_agent",
+            "_identity",
+            "_allowlist",
+            "_plugin_name",
+            "_violation_callback",
+            "_call_timestamps",
+            "_rate_limit_lock",
+            # Current internals and helpers.
+            "_state",
+            "_check_rate_limit",
+            "_report_violation",
+            # Instance and class plumbing.
+            "__dict__",
+            "__slots__",
+            "__weakref__",
+            "__init__",
+            "__getattribute__",
+            "__setattr__",
+            "__reduce__",
+            "__reduce_ex__",
+            "__getstate__",
+        ],
+    )
+    def test_internal_attribute_is_refused(
+        self, airlock: Airlock, events: list[str], attr: str
+    ) -> None:
+        with pytest.raises(AirlockViolation):
+            getattr(airlock, attr)
+        assert events == [attr]
+
+    def test_vars_is_refused(self, airlock: Airlock, events: list[str]) -> None:
+        with pytest.raises(AirlockViolation):
+            vars(airlock)
+        assert events == ["__dict__"]
+
+    def test_copy_and_pickle_are_refused(self, airlock: Airlock) -> None:
+        with pytest.raises(AirlockViolation):
+            copy.copy(airlock)
+        with pytest.raises(AirlockViolation):
+            copy.deepcopy(airlock)
+        with pytest.raises(AirlockViolation):
+            pickle.dumps(airlock)
+
+    @pytest.mark.parametrize(
+        "attr",
+        ["__self__", "__func__", "__closure__", "__wrapped__", "__globals__"],
+    )
+    def test_returned_method_does_not_expose_agent(
+        self, airlock: Airlock, events: list[str], attr: str
+    ) -> None:
+        method = airlock.do_thing
+        with pytest.raises(AirlockViolation):
+            getattr(method, attr)
+        assert events == [f"do_thing.{attr}"]
+
+    def test_returned_method_still_works(self, airlock: Airlock) -> None:
+        method = airlock.do_thing
+        assert method(4) == 8
+        assert method.__name__ == "do_thing"
+        assert callable(method)
+
+    def test_returned_method_attributes_cannot_be_set(self, airlock: Airlock) -> None:
+        method = airlock.do_thing
+        with pytest.raises(AirlockViolation):
+            method._target = print
+        assert method(4) == 8
+
+    def test_allowlist_cannot_be_replaced(
+        self, airlock: Airlock, events: list[str]
+    ) -> None:
+        widened = AllowlistSpec(methods=frozenset({"dangerous"}))
+        with pytest.raises(AirlockViolation):
+            airlock._allowlist = widened
+        with pytest.raises(AirlockViolation):
+            airlock._state = widened
+        with pytest.raises(AirlockViolation):
+            airlock.dangerous()
+        assert events == ["_allowlist", "_state", "dangerous"]
+
+    def test_attributes_cannot_be_set_or_deleted(self, airlock: Airlock) -> None:
+        with pytest.raises(AirlockViolation) as excinfo:
+            airlock.do_thing = lambda x: x
+        assert "set 'do_thing'" in str(excinfo.value)
+        with pytest.raises(AirlockViolation) as excinfo:
+            del airlock.tenant_id
+        assert "delete 'tenant_id'" in str(excinfo.value)
+        assert airlock.do_thing(1) == 2
+        assert airlock.tenant_id == "tenant-1"
+
+    def test_dir_lists_only_the_permitted_surface(self, airlock: Airlock) -> None:
+        assert dir(airlock) == sorted(
+            {"agent_id", "did", "tenant_id", "do_thing", "get_status", "name", "state"}
+        )
+
+    def test_repr_does_not_include_agent(self, airlock: Airlock) -> None:
+        assert repr(airlock) == "<Airlock plugin='p'>"
+        assert repr(airlock.do_thing) == "<airlock method 'do_thing'>"
+
+    def test_type_identity_and_weakref_still_work(self, airlock: Airlock) -> None:
+        assert isinstance(airlock, Airlock)
+        assert airlock.__class__ is Airlock
+        assert weakref.ref(airlock)() is airlock
+
+    def test_allowlisted_underscore_name_reads_from_agent(
+        self, agent: _Agent, identity: _Identity
+    ) -> None:
+        """The allowlist decides; a host may expose an underscore name."""
+        airlock = Airlock(
+            agent, identity, AllowlistSpec(properties=frozenset({"_private"}))
+        )
+        assert airlock._private == "secret"

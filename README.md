@@ -4,7 +4,7 @@ Capability-gated plugin sandbox for autonomous agents.
 
 ## What It Does
 
-- **Allowlist-based access control** — Plugins can only call the methods and properties you explicitly permit on the host agent. Everything else raises `AirlockViolation` and fires a violation callback.
+- **Allowlist-based access control** — Through the Airlock, plugins can only call the methods and properties you explicitly permit on the host agent. Everything else, including the Airlock's own state (`airlock._agent`, `__dict__`, `vars()`, copy/pickle hooks, attribute assignment), raises `AirlockViolation` and fires a violation callback. See [Limits](#limits).
 - **Injected identity** — The Airlock does not inspect the host agent's internals. Pass an `AgentIdentity` implementation (`agent_id`, `did`, `tenant_id`) so plugins and audit callbacks see the values you choose to expose.
 - **Per-method rate limiting** — Configure call caps through `AllowlistSpec.rate_limits`, a plain dict keyed by method name. The key `"*"` sets a default applied to any method without its own limit.
 - **Plugin attestation** — Optional Ed25519-signed `PluginManifest` binds plugin identity to a content hash. `PluginRegistry.set_attestation_required(True)` makes attestation mandatory at registration time.
@@ -23,7 +23,11 @@ pip install git+https://github.com/Sharathvc23/sm-airlock.git
 from dataclasses import dataclass
 
 from sm_airlock import (
-    AgentPlugin, Airlock, AllowlistSpec, PluginManifest, PluginRegistry,
+    AgentPlugin,
+    Airlock,
+    AllowlistSpec,
+    PluginManifest,
+    PluginRegistry,
 )
 
 
@@ -74,6 +78,7 @@ registry.register(MetricsPlugin())
 registry = PluginRegistry()
 registry.set_attestation_required(True)
 
+
 class SignedPlugin(AgentPlugin):
     @property
     def name(self) -> str:
@@ -93,8 +98,21 @@ class SignedPlugin(AgentPlugin):
             signed_at="2026-04-17T00:00:00Z",
         )
 
+
 registry.register(SignedPlugin())  # passes
 ```
+
+## Limits
+
+The Airlock is an in-process attribute filter, not an isolation boundary. It refuses ordinary attribute access from the proxy to the host agent: the stored agent reference, `__dict__`/`vars()`, copy and pickle hooks, setting or deleting attributes, and the `__self__`/`__closure__` of the method wrappers it returns. Plugin code still runs in the host's interpreter, so it can reach the host agent by other means, for example:
+
+- `object.__getattribute__(airlock, "_state")` or descriptors on `type(airlock)`
+- the `gc` module (`gc.get_referents`, `gc.get_objects`)
+- frame objects (`sys._getframe()`, the traceback of a caught exception)
+
+Values returned by allowlisted methods and properties are passed through unchanged. If an allowlisted member returns the agent, or an object that references it, the plugin gets that reference.
+
+Treat the Airlock as a way to keep cooperating plugins on a declared API surface and to get an audit signal when they step off it. Plugin code that must not reach the host agent needs a process boundary (a separate process or container with an IPC interface).
 
 ## Effect Staging
 
@@ -118,6 +136,6 @@ MIT
 
 ---
 
-*First published: 2026-04-15 | Last modified: 2026-04-17*
+*First published: 2026-04-15 | Last modified: 2026-11-17*
 
 *Personal research contributions aligned with [Project NANDA](https://projectnanda.org) standards. [Stellarminds.ai](https://stellarminds.ai)*
