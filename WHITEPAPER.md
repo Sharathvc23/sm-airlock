@@ -84,7 +84,7 @@ staging compose with a separate primitive such as `sm-enclave`.
 
 | Component | Responsibility |
 |-----------|---------------|
-| `Airlock` | Proxy that intercepts `__getattr__`, enforces allowlist and rate limits |
+| `Airlock` | Proxy that intercepts `__getattribute__`, enforces allowlist and rate limits |
 | `AllowlistSpec` | Frozen dataclass declaring permitted methods, properties, and rate limits |
 | `AgentIdentity` | Protocol for identity fields (`agent_id`, `did`, `tenant_id`) |
 | `NullIdentity` | Default identity returning empty strings |
@@ -120,6 +120,22 @@ raises, the exception is caught and logged with a stack trace. The
 `AirlockViolation` is still raised to the plugin. Audit infrastructure
 failures never suppress security enforcement.
 
+**Every lookup goes through the allowlist.** The Airlock overrides
+`__getattribute__`, not only `__getattr__`. `__getattr__` runs only for
+names the object does not already have, so state stored on the proxy (the
+agent reference, `__dict__`, helper methods) would bypass the allowlist.
+With `__getattribute__`, the only names the Airlock serves itself are the
+identity fields and `__class__`; setting and deleting attributes are
+refused, and allowlisted methods are returned as wrappers that do not
+expose the agent through `__self__` or `__closure__`.
+
+**In-process, not an isolation boundary.** The Airlock filters attribute
+access on the proxy. Plugin code shares the host's interpreter and can
+still reach the host agent through `object.__getattribute__`, descriptors
+on `type(airlock)`, the `gc` module, or frame objects. Values returned by
+allowlisted members are passed through unchanged. Plugins that must not
+reach the host agent need a process boundary.
+
 **Staging is out of scope.** The Airlock is a capability-gating
 primitive. For speculative effect staging, compose with `sm-enclave`.
 
@@ -146,6 +162,6 @@ sm-airlock composes with other packages in the sm-* family:
 
 ---
 
-*First published: 2026-04-15 | Last modified: 2026-04-17*
+*First published: 2026-04-15 | Last modified: 2026-11-17*
 
 *Personal research contributions aligned with [Project NANDA](https://projectnanda.org) standards. [Stellarminds.ai](https://stellarminds.ai)*
