@@ -179,6 +179,7 @@ class TestViolationCallback:
         event_type, metadata = events[0]
         assert event_type == "sandbox.violation"
         assert metadata["attempted_attr"] == "dangerous"
+        assert metadata["operation"] == "access"
         assert metadata["plugin_name"] == "my-plugin"
         assert metadata["tenant_id"] == identity.tenant_id
         assert metadata["agent_did"] == identity.did
@@ -456,6 +457,37 @@ class TestWrappedAgentNotReachable:
         assert "delete 'tenant_id'" in str(excinfo.value)
         assert airlock.do_thing(1) == 2
         assert airlock.tenant_id == "tenant-1"
+
+    def test_callback_reports_the_attempted_operation(
+        self, agent: _Agent, identity: _Identity
+    ) -> None:
+        reported: list[tuple[str, str]] = []
+        allowlist = AllowlistSpec(
+            methods=frozenset({"do_thing"}), rate_limits={"do_thing": 1}
+        )
+        airlock = Airlock(
+            agent,
+            identity,
+            allowlist,
+            violation_callback=lambda e, m: reported.append(
+                (m["operation"], m["attempted_attr"])
+            ),
+        )
+        with pytest.raises(AirlockViolation):
+            _ = airlock._agent
+        with pytest.raises(AirlockViolation):
+            airlock._agent = None
+        with pytest.raises(AirlockViolation):
+            del airlock._agent
+        airlock.do_thing(1)
+        with pytest.raises(PluginRateLimitExceeded):
+            airlock.do_thing(1)
+        assert reported == [
+            ("access", "_agent"),
+            ("set", "_agent"),
+            ("delete", "_agent"),
+            ("call", "do_thing"),
+        ]
 
     def test_dir_lists_only_the_permitted_surface(self, airlock: Airlock) -> None:
         assert dir(airlock) == sorted(

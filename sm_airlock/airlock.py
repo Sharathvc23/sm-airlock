@@ -184,20 +184,25 @@ class _AirlockState:
 
     def deny(self, attr_name: str, operation: str = "access") -> NoReturn:
         """Report a violation and raise ``AirlockViolation``."""
-        self.report_violation(attr_name)
+        self.report_violation(attr_name, operation)
         raise AirlockViolation(
             agent_did=self.identity.did,
             attempted_operation=f"{operation} '{attr_name}'",
             sandbox_boundary="plugin sandbox",
         )
 
-    def report_violation(self, attr_name: str) -> None:
+    def report_violation(self, attr_name: str, operation: str = "access") -> None:
         """Report a sandbox violation via callback and logging.
+
+        ``operation`` is ``"access"``, ``"set"``, ``"delete"`` or ``"call"``
+        (rate limit exceeded); it is passed to the callback as
+        ``metadata["operation"]``.
 
         Does not raise — callers raise after this returns.
         """
         metadata: dict[str, Any] = {
             "attempted_attr": attr_name,
+            "operation": operation,
             "plugin_name": self.plugin_name,
             "tenant_id": self.identity.tenant_id,
             "agent_did": self.identity.did,
@@ -212,8 +217,9 @@ class _AirlockState:
                     exc_info=True,
                 )
         logger.warning(
-            "Airlock violation: plugin=%s attempted access to '%s'",
+            "Airlock violation: plugin=%s attempted %s of '%s'",
             self.plugin_name,
+            operation,
             attr_name,
         )
 
@@ -237,7 +243,7 @@ class _AirlockState:
                 timestamps.popleft()
 
             if len(timestamps) >= limit:
-                self.report_violation(method)
+                self.report_violation(method, "call")
                 raise PluginRateLimitExceeded(self.plugin_name, method, limit)
             timestamps.append(now)
 
